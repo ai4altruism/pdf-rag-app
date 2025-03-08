@@ -1,0 +1,20 @@
+# Core dependencies
+streamlit
+python-dotenv
+openai
+
+# PDF processing
+pypdf
+langchain-text-splitters
+langchain-core
+langchain-openai
+tiktoken  # For token counting
+
+# Vector database and embeddings
+sentence-transformers
+chromadb
+langchain-community
+pydantic
+
+# Utility libraries
+tqdm

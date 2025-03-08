@@ -1,0 +1,18 @@
+# Environment variables and secrets
+.env
+
+# Python virtual environment
+.venv/
+
+# Data directories
+data/
+data/pdfs/
+data/chroma_db/
+*.pdf
+
+# Python cache files
+__pycache__/
+utils/__pycache__
+
+# Streamlit
+.streamlit/
