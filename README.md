@@ -53,10 +53,10 @@ EMBEDDING_MODEL=text-embedding-3-small
 EMBEDDING_DIMENSIONS=1536  # Optional: Can be reduced for better efficiency
 
 # Re-ranking System Prompt
-RERANKING_SYSTEM_PROMPT=You are an expert at analyzing document chunks for relevance to a query. For each document chunk, assign a relevance score from 0-10. Focus on semantic relevance rather than keyword matching. A document with a score of 10 perfectly answers the query, while a score of 0 means it's completely irrelevant. Use only the most relevant document chunks to answer the question.
+RERANKING_SYSTEM_PROMPT=You are an expert at analyzing document chunks for relevance to a query. For each document chunk, assign a relevance score from 0-10. Focus on semantic relevance rather than keyword matching. A document with a score of 10 perfectly answers the query, while a score of 0 means it's completely irrelevant. Explain your reasoning for each score.
 
 # Answer Generation System Prompt
-ANSWER_SYSTEM_PROMPT=You are a helpful assistant that answers questions based on the provided document context. Only answer what can be inferred from the context. If the context does not provide enough information to answer the question, state that clearly. Do not make up information.
+ANSWER_SYSTEM_PROMPT=You are a helpful assistant that answers questions based on the provided document context. Only answer what can be inferred from the context. If the context doesn't provide enough information to answer the question, state that clearly. Do not make up information.
 ```
 
 ### 5. Create Required Directories
@@ -143,6 +143,7 @@ pdf-rag-app/
 ├── app.py                   # Main Streamlit application
 ├── requirements.txt         # Project dependencies
 ├── README.md                # Project documentation
+├── .gitignore               # Git ignore configuration
 ├── utils/                   # Utility modules
 │   ├── __init__.py          # Make utils a proper package
 │   ├── document_processor.py # PDF loading, chunking, and embedding
@@ -152,3 +153,21 @@ pdf-rag-app/
     ├── pdfs/                # Directory for uploaded PDFs
     └── chroma_db/           # ChromaDB persistence directory
 ```
+
+## License
+
+This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
+
+When using or distributing this software, please attribute as follows:
+
+```
+PDF RAG Application
+Copyright (C) 2025 AI4Altruism
+License: GNU GPL v3.0
+```
+
+## Contact
+
+For questions, suggestions, or collaboration opportunities, please contact:
+
+Email: team@ai4altruism.org
