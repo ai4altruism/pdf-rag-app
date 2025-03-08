@@ -162,7 +162,7 @@ When using or distributing this software, please attribute as follows:
 
 ```
 PDF RAG Application
-Copyright (C) 2025 AI4Altruism
+Copyright (C) 2025 AI for Altruism Inc
 License: GNU GPL v3.0
 ```
 
