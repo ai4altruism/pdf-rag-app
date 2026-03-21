@@ -13,7 +13,7 @@ from src.models.document import Document
 from src.models.ingestion_job import IngestionJob
 from src.pipelines.ingestion import create_parser
 from src.pipelines.ingestion.chunker import DocumentChunker
-from src.providers.base import EmbeddingProvider
+from src.providers.base import EmbeddingProvider, LLMProvider
 from src.storage.qdrant import ChunkPayload, QdrantStore
 
 logger = get_logger(__name__)
@@ -38,11 +38,13 @@ class IngestionPipeline:
         qdrant: QdrantStore,
         embedding_provider: EmbeddingProvider,
         settings: Settings,
+        llm_provider: LLMProvider | None = None,
     ):
         self._db = db
         self._qdrant = qdrant
         self._embedding = embedding_provider
         self._settings = settings
+        self._llm = llm_provider
 
     async def ingest(
         self,
@@ -52,6 +54,7 @@ class IngestionPipeline:
         parser_override: str | None = None,
         chunk_size_override: int | None = None,
         chunk_overlap_override: int | None = None,
+        enrichment_override: bool | None = None,
     ) -> None:
         """Run the full ingestion pipeline for a single document.
 
@@ -61,6 +64,7 @@ class IngestionPipeline:
             parser_override: Override the configured parser type.
             chunk_size_override: Override the configured chunk size.
             chunk_overlap_override: Override the configured chunk overlap.
+            enrichment_override: Override the configured enrichment toggle.
         """
         doc = await self._db.get(Document, document_id)
         if not doc:
@@ -70,6 +74,15 @@ class IngestionPipeline:
         parser_type = parser_override or self._settings.parser
         chunk_size = chunk_size_override or self._settings.chunk_size_tokens
         chunk_overlap = chunk_overlap_override or self._settings.chunk_overlap_tokens
+        enrichment_enabled = (
+            enrichment_override
+            if enrichment_override is not None
+            else self._settings.contextual_enrichment
+        )
+        # Enrichment requires an LLM provider
+        if enrichment_enabled and self._llm is None:
+            enrichment_enabled = False
+            logger.warning("enrichment_disabled_no_llm", document_id=document_id)
 
         # Create ingestion job
         job = IngestionJob(
@@ -78,7 +91,7 @@ class IngestionPipeline:
             parser=parser_type,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
-            contextual_enrichment=False,  # Sprint 4
+            contextual_enrichment=enrichment_enabled,
             started_at=datetime.utcnow(),
         )
         self._db.add(job)
@@ -121,6 +134,35 @@ class IngestionPipeline:
                 job.completed_at = datetime.utcnow()
                 await self._db.commit()
                 return
+
+            # --- Stage 2.5: Enrich (optional) ---
+            if enrichment_enabled:
+                doc.status = "enriching"
+                await self._db.commit()
+
+                logger.info(
+                    "ingestion_stage",
+                    stage="enriching",
+                    document_id=document_id,
+                    chunk_count=len(child_chunks),
+                )
+                from src.pipelines.ingestion.enricher import ContextualEnricher
+
+                enricher = ContextualEnricher(self._llm)
+                chunk_dicts = [
+                    {
+                        "text": c.text,
+                        "header_chain": c.header_chain,
+                        "chunk_id": c.chunk_id,
+                    }
+                    for c in child_chunks
+                ]
+                enriched = await enricher.enrich_chunks(
+                    chunk_dicts, document_title=doc.title or doc.filename
+                )
+                # Update child chunks with enriched text and summaries
+                for child, enriched_dict in zip(child_chunks, enriched, strict=True):
+                    child.text = enriched_dict["text"]
 
             doc.status = "embedding"
             await self._db.commit()

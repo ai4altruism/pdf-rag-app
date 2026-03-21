@@ -30,9 +30,21 @@ async def _run_ingestion(
     parser_override: str | None = None,
     chunk_size_override: int | None = None,
     chunk_overlap_override: int | None = None,
+    enrichment_override: bool | None = None,
 ) -> None:
     """Run ingestion in a background task with its own DB session."""
     from src.pipelines.ingestion.pipeline import IngestionPipeline
+
+    # Create LLM provider for enrichment if enabled
+    llm_provider = None
+    enrichment = enrichment_override if enrichment_override is not None else settings.contextual_enrichment
+    if enrichment:
+        try:
+            from src.providers import create_llm_provider
+
+            llm_provider = create_llm_provider(settings)
+        except Exception:
+            pass  # Pipeline will log warning and skip enrichment
 
     engine = create_async_engine(settings.database_url, echo=False)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -40,7 +52,11 @@ async def _run_ingestion(
     async with session_factory() as db:
         try:
             pipeline = IngestionPipeline(
-                db=db, qdrant=qdrant, embedding_provider=embedding_provider, settings=settings
+                db=db,
+                qdrant=qdrant,
+                embedding_provider=embedding_provider,
+                settings=settings,
+                llm_provider=llm_provider,
             )
             await pipeline.ingest(
                 document_id,
@@ -48,6 +64,7 @@ async def _run_ingestion(
                 parser_override=parser_override,
                 chunk_size_override=chunk_size_override,
                 chunk_overlap_override=chunk_overlap_override,
+                enrichment_override=enrichment_override,
             )
         except Exception:
             await db.rollback()
@@ -199,6 +216,7 @@ async def reingest_document(
     parser_override = body.parser if body else None
     chunk_size_override = body.chunk_size_tokens if body else None
     chunk_overlap_override = body.chunk_overlap_tokens if body else None
+    enrichment_override = body.contextual_enrichment if body else None
 
     background_tasks.add_task(
         _run_ingestion,
@@ -210,6 +228,7 @@ async def reingest_document(
         parser_override=parser_override,
         chunk_size_override=chunk_size_override,
         chunk_overlap_override=chunk_overlap_override,
+        enrichment_override=enrichment_override,
     )
 
     return DocumentResponse.model_validate(doc)
