@@ -7,10 +7,13 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.routes.collections import _qdrant_collection_name
 from src.config import Settings, get_settings
 from src.models.document import Document
 from src.schemas import DocumentResponse, ReingestRequest
+from src.storage import get_qdrant
 from src.storage.database import get_db
+from src.storage.qdrant import QdrantStore
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
@@ -52,11 +55,15 @@ async def upload_documents(
         file_path = upload_dir / f"{file_hash}_{safe_name}"
         file_path.write_bytes(content)
 
+        # Extract page count
+        page_count = _get_pdf_page_count(file_path)
+
         doc = Document(
             collection_id=collection_id,
             filename=safe_name,
             file_size_bytes=len(content),
             file_hash=file_hash,
+            page_count=page_count,
             status="pending",
         )
         db.add(doc)
@@ -93,12 +100,21 @@ async def get_document(document_id: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.delete("/{document_id}", status_code=204)
-async def delete_document(document_id: str, db: AsyncSession = Depends(get_db)):
-    """Delete a document and its associated data."""
+async def delete_document(
+    document_id: str,
+    db: AsyncSession = Depends(get_db),
+    qdrant: QdrantStore = Depends(get_qdrant),
+):
+    """Delete a document and its vectors from Qdrant."""
     doc = await db.get(Document, document_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
-    # TODO: Also delete vectors from Qdrant (Sprint 2)
+
+    # Delete vectors from Qdrant
+    qdrant_name = _qdrant_collection_name(doc.collection_id)
+    if await qdrant.collection_exists(qdrant_name):
+        await qdrant.delete_points_by_document(qdrant_name, document_id)
+
     await db.delete(doc)
 
 
@@ -117,3 +133,14 @@ async def reingest_document(
     await db.refresh(doc)
     # TODO: Trigger background ingestion pipeline (Sprint 3)
     return DocumentResponse.model_validate(doc)
+
+
+def _get_pdf_page_count(file_path: Path) -> int | None:
+    """Extract page count from a PDF file."""
+    try:
+        import pypdf
+
+        reader = pypdf.PdfReader(str(file_path))
+        return len(reader.pages)
+    except Exception:
+        return None
