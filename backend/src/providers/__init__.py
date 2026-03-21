@@ -16,6 +16,30 @@ def create_embedding_provider(settings: Settings) -> EmbeddingProvider:
                 dimensions=settings.embedding_dimensions,
                 batch_size=settings.embedding_batch_size,
             )
+        case "cohere":
+            from src.providers.embedding.cohere import CohereEmbeddingProvider
+
+            return CohereEmbeddingProvider(
+                api_key=settings.cohere_api_key,
+                model=settings.embedding_model,
+                dimensions=settings.embedding_dimensions,
+            )
+        case "sentence-transformers":
+            from src.providers.embedding.sentence_transformers import (
+                SentenceTransformersEmbeddingProvider,
+            )
+
+            return SentenceTransformersEmbeddingProvider(
+                model=settings.embedding_model,
+                dimensions=settings.embedding_dimensions,
+            )
+        case "ollama":
+            from src.providers.embedding.ollama import OllamaEmbeddingProvider
+
+            return OllamaEmbeddingProvider(
+                model=settings.embedding_model,
+                dimensions=settings.embedding_dimensions,
+            )
         case _:
             raise ValueError(f"Unknown embedding provider: {settings.embedding_provider}")
 
