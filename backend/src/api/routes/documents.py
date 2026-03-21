@@ -3,15 +3,16 @@
 import hashlib
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from src.api.routes.collections import _qdrant_collection_name
 from src.config import Settings, get_settings
 from src.models.document import Document
+from src.providers.base import EmbeddingProvider
 from src.schemas import DocumentResponse, ReingestRequest
-from src.storage import get_qdrant
+from src.storage import get_embedding_provider, get_qdrant
 from src.storage.database import get_db
 from src.storage.qdrant import QdrantStore
 
@@ -20,12 +21,50 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 ALLOWED_CONTENT_TYPES = {"application/pdf"}
 
 
+async def _run_ingestion(
+    document_id: str,
+    file_path: Path,
+    settings: Settings,
+    qdrant: QdrantStore,
+    embedding_provider: EmbeddingProvider,
+    parser_override: str | None = None,
+    chunk_size_override: int | None = None,
+    chunk_overlap_override: int | None = None,
+) -> None:
+    """Run ingestion in a background task with its own DB session."""
+    from src.pipelines.ingestion.pipeline import IngestionPipeline
+
+    engine = create_async_engine(settings.database_url, echo=False)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with session_factory() as db:
+        try:
+            pipeline = IngestionPipeline(
+                db=db, qdrant=qdrant, embedding_provider=embedding_provider, settings=settings
+            )
+            await pipeline.ingest(
+                document_id,
+                file_path,
+                parser_override=parser_override,
+                chunk_size_override=chunk_size_override,
+                chunk_overlap_override=chunk_overlap_override,
+            )
+        except Exception:
+            await db.rollback()
+            raise
+
+    await engine.dispose()
+
+
 @router.post("/upload", response_model=list[DocumentResponse], status_code=201)
 async def upload_documents(
     files: list[UploadFile],
     collection_id: str,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     settings: Settings = Depends(get_settings),
+    qdrant: QdrantStore = Depends(get_qdrant),
+    embedding_provider: EmbeddingProvider = Depends(get_embedding_provider),
 ):
     """Upload one or more PDF files to a collection."""
     max_bytes = settings.max_upload_size_mb * 1024 * 1024
@@ -69,9 +108,22 @@ async def upload_documents(
         db.add(doc)
         await db.flush()
         await db.refresh(doc)
-        documents.append(doc)
+        documents.append((doc, file_path))
 
-    return [DocumentResponse.model_validate(doc) for doc in documents]
+    # Schedule background ingestion for each document
+    response = []
+    for doc, fpath in documents:
+        background_tasks.add_task(
+            _run_ingestion,
+            document_id=doc.id,
+            file_path=fpath,
+            settings=settings,
+            qdrant=qdrant,
+            embedding_provider=embedding_provider,
+        )
+        response.append(DocumentResponse.model_validate(doc))
+
+    return response
 
 
 @router.get("", response_model=list[DocumentResponse])
@@ -121,18 +173,56 @@ async def delete_document(
 @router.post("/{document_id}/reingest", response_model=DocumentResponse)
 async def reingest_document(
     document_id: str,
+    background_tasks: BackgroundTasks,
     body: ReingestRequest | None = None,
     db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+    qdrant: QdrantStore = Depends(get_qdrant),
+    embedding_provider: EmbeddingProvider = Depends(get_embedding_provider),
 ):
     """Re-process a document with optional new settings."""
     doc = await db.get(Document, document_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
+
     doc.status = "pending"
     await db.flush()
     await db.refresh(doc)
-    # TODO: Trigger background ingestion pipeline (Sprint 3)
+
+    # Resolve file path
+    upload_dir = Path(settings.upload_dir)
+    file_path = _find_document_file(upload_dir, doc.file_hash, doc.filename)
+    if not file_path:
+        raise HTTPException(status_code=404, detail="Source PDF file not found on disk")
+
+    # Parse overrides from request body
+    parser_override = body.parser if body else None
+    chunk_size_override = body.chunk_size_tokens if body else None
+    chunk_overlap_override = body.chunk_overlap_tokens if body else None
+
+    background_tasks.add_task(
+        _run_ingestion,
+        document_id=doc.id,
+        file_path=file_path,
+        settings=settings,
+        qdrant=qdrant,
+        embedding_provider=embedding_provider,
+        parser_override=parser_override,
+        chunk_size_override=chunk_size_override,
+        chunk_overlap_override=chunk_overlap_override,
+    )
+
     return DocumentResponse.model_validate(doc)
+
+
+def _find_document_file(upload_dir: Path, file_hash: str | None, filename: str) -> Path | None:
+    """Locate the uploaded PDF file on disk by hash and filename."""
+    if not file_hash:
+        return None
+    expected = upload_dir / f"{file_hash}_{filename}"
+    if expected.exists():
+        return expected
+    return None
 
 
 def _get_pdf_page_count(file_path: Path) -> int | None:
