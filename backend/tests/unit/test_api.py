@@ -1,16 +1,27 @@
 """Tests for API endpoints."""
 
 
-
 class TestHealthEndpoint:
-    async def test_health_returns_ok(self, client):
+    async def test_health_returns_status(self, client):
         response = await client.get("/api/health")
         assert response.status_code == 200
         data = response.json()
-        assert data["status"] == "ok"
+        assert "status" in data
         assert "qdrant" in data
         assert "embedding_provider" in data
         assert "llm_provider" in data
+
+    async def test_health_qdrant_ok(self, client, mock_qdrant):
+        mock_qdrant.health_check.return_value = True
+        response = await client.get("/api/health")
+        data = response.json()
+        assert data["qdrant"]["status"] == "ok"
+
+    async def test_health_qdrant_error(self, client, mock_qdrant):
+        mock_qdrant.health_check.return_value = False
+        response = await client.get("/api/health")
+        data = response.json()
+        assert data["qdrant"]["status"] == "error"
 
 
 class TestCollectionsAPI:
@@ -75,20 +86,69 @@ class TestSettingsAPI:
 
 
 class TestQueryAPI:
-    async def test_query_stub(self, client):
-        # First create a collection to use its ID
+    async def test_query_returns_results(self, client, mock_qdrant):
+        from unittest.mock import AsyncMock, patch
+
+        from src.storage.qdrant import SearchResult
+
+        # Create a collection
         col_resp = await client.post("/api/collections", json={"name": "Query Test"})
         col_id = col_resp.json()["id"]
 
-        response = await client.post(
-            "/api/query",
-            json={"query": "test question", "collection_ids": [col_id]},
-        )
+        # Mock embedding provider
+        mock_provider = AsyncMock()
+        mock_provider.embed_query.return_value = [0.1] * 1024
+
+        # Mock hybrid search to return a result
+        mock_qdrant.hybrid_search.return_value = [
+            SearchResult(
+                id="point-1",
+                score=0.95,
+                payload={
+                    "document_id": "doc-1",
+                    "filename": "test.pdf",
+                    "page_numbers": [1],
+                    "header_chain": ["Section 1"],
+                    "chunk_text": "Test chunk content",
+                },
+            )
+        ]
+
+        with patch(
+            "src.api.routes.query.create_embedding_provider", return_value=mock_provider
+        ):
+            response = await client.post(
+                "/api/query",
+                json={"query": "test question", "collection_ids": [col_id]},
+            )
         assert response.status_code == 200
         data = response.json()
         assert "answer" in data
         assert "sources" in data
-        assert "metadata" in data
+        assert len(data["sources"]) == 1
+        assert data["sources"][0]["filename"] == "test.pdf"
+        assert data["sources"][0]["relevance_score"] == 0.95
+        assert data["metadata"]["retrieval_count"] == 1
+
+    async def test_query_empty_collection(self, client, mock_qdrant):
+        from unittest.mock import AsyncMock, patch
+
+        col_resp = await client.post("/api/collections", json={"name": "Empty"})
+        col_id = col_resp.json()["id"]
+
+        mock_provider = AsyncMock()
+        mock_provider.embed_query.return_value = [0.1] * 1024
+        mock_qdrant.hybrid_search.return_value = []
+
+        with patch(
+            "src.api.routes.query.create_embedding_provider", return_value=mock_provider
+        ):
+            response = await client.post(
+                "/api/query",
+                json={"query": "test question", "collection_ids": [col_id]},
+            )
+        assert response.status_code == 200
+        assert response.json()["sources"] == []
 
 
 class TestConversationsAPI:

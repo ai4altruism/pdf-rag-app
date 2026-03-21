@@ -10,7 +10,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from src.config import Settings, get_settings
 from src.main import app
+from src.storage import get_qdrant
 from src.storage.database import Base, get_db
+from src.storage.qdrant import QdrantStore
 
 
 @pytest.fixture(scope="session")
@@ -54,7 +56,23 @@ def test_settings() -> Settings:
 
 
 @pytest.fixture
-async def client(test_settings: Settings) -> AsyncGenerator[AsyncClient, None]:
+def mock_qdrant() -> AsyncMock:
+    """Mock QdrantStore for API tests that need Qdrant."""
+    mock = AsyncMock(spec=QdrantStore)
+    mock.create_collection.return_value = None
+    mock.delete_collection.return_value = None
+    mock.collection_exists.return_value = True
+    mock.delete_points_by_document.return_value = None
+    mock.hybrid_search.return_value = []
+    mock.dense_search.return_value = []
+    mock.health_check.return_value = True
+    return mock
+
+
+@pytest.fixture
+async def client(
+    test_settings: Settings, mock_qdrant: AsyncMock
+) -> AsyncGenerator[AsyncClient, None]:
     """Create a test HTTP client with overridden dependencies.
 
     Each request gets its own session from a shared in-memory DB so that
@@ -78,8 +96,12 @@ async def client(test_settings: Settings) -> AsyncGenerator[AsyncClient, None]:
     def override_get_settings() -> Settings:
         return test_settings
 
+    def override_get_qdrant() -> AsyncMock:
+        return mock_qdrant
+
     app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[get_settings] = override_get_settings
+    app.dependency_overrides[get_qdrant] = override_get_qdrant
 
     async with AsyncClient(
         transport=ASGITransport(app=app),

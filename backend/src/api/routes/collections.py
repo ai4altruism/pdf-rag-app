@@ -7,18 +7,33 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.models.collection import Collection
 from src.models.document import Document
 from src.schemas import CollectionCreate, CollectionResponse, CollectionUpdate
+from src.storage import get_qdrant
 from src.storage.database import get_db
+from src.storage.qdrant import QdrantStore
 
 router = APIRouter(prefix="/collections", tags=["collections"])
 
 
+def _qdrant_collection_name(collection_id: str) -> str:
+    """Convert a DB collection ID to a Qdrant collection name."""
+    return f"col_{collection_id}"
+
+
 @router.post("", response_model=CollectionResponse, status_code=201)
-async def create_collection(body: CollectionCreate, db: AsyncSession = Depends(get_db)):
+async def create_collection(
+    body: CollectionCreate,
+    db: AsyncSession = Depends(get_db),
+    qdrant: QdrantStore = Depends(get_qdrant),
+):
     """Create a new document collection."""
     collection = Collection(name=body.name, description=body.description)
     db.add(collection)
     await db.flush()
     await db.refresh(collection)
+
+    # Create corresponding Qdrant collection
+    await qdrant.create_collection(_qdrant_collection_name(collection.id))
+
     return CollectionResponse(
         id=collection.id,
         name=collection.name,
@@ -102,9 +117,18 @@ async def update_collection(
 
 
 @router.delete("/{collection_id}", status_code=204)
-async def delete_collection(collection_id: str, db: AsyncSession = Depends(get_db)):
-    """Delete a collection and all its documents."""
+async def delete_collection(
+    collection_id: str,
+    db: AsyncSession = Depends(get_db),
+    qdrant: QdrantStore = Depends(get_qdrant),
+):
+    """Delete a collection and all its documents, including Qdrant data."""
     collection = await db.get(Collection, collection_id)
     if not collection:
         raise HTTPException(status_code=404, detail="Collection not found")
+
+    # Delete Qdrant collection (all vectors)
+    await qdrant.delete_collection(_qdrant_collection_name(collection_id))
+
+    # Cascade deletes documents via ORM relationship
     await db.delete(collection)

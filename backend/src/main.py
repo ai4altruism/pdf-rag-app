@@ -3,14 +3,17 @@
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.api import api_router
 from src.api.websocket import router as ws_router
 from src.config import get_settings
 from src.logging import RequestIDMiddleware, setup_logging
+from src.schemas import DependencyStatus, HealthResponse
+from src.storage import get_qdrant
 from src.storage.database import init_db
+from src.storage.qdrant import QdrantStore
 
 
 @asynccontextmanager
@@ -46,14 +49,46 @@ app.include_router(ws_router)
 
 
 @app.get("/api/health", tags=["health"])
-async def health_check():
+async def health_check(qdrant: QdrantStore = Depends(get_qdrant)):
     """Check the health of all dependencies."""
-    from src.schemas import DependencyStatus, HealthResponse
+    # Qdrant check
+    qdrant_ok = await qdrant.health_check()
+    qdrant_status = DependencyStatus(
+        status="ok" if qdrant_ok else "error",
+        message="Connected" if qdrant_ok else "Unreachable",
+    )
 
-    # TODO: Real dependency checks (Sprint 2)
+    # Embedding provider check
+    try:
+        from src.providers import create_embedding_provider
+
+        provider = create_embedding_provider(get_settings())
+        embed_status = DependencyStatus(
+            status="ok",
+            message=f"Model: {provider.model_name} ({provider.dimensions}d)",
+        )
+    except Exception as e:
+        embed_status = DependencyStatus(status="error", message=str(e))
+
+    # LLM provider check
+    try:
+        from src.providers import create_llm_provider
+
+        provider = create_llm_provider(get_settings())
+        llm_status = DependencyStatus(
+            status="ok",
+            message=f"Model: {provider.model_name}",
+        )
+    except Exception as e:
+        llm_status = DependencyStatus(status="error", message=str(e))
+
+    overall = "ok" if all(
+        s.status == "ok" for s in [qdrant_status, embed_status, llm_status]
+    ) else "degraded"
+
     return HealthResponse(
-        status="ok",
-        qdrant=DependencyStatus(status="ok", message="Not yet connected"),
-        embedding_provider=DependencyStatus(status="ok", message="Not yet configured"),
-        llm_provider=DependencyStatus(status="ok", message="Not yet configured"),
+        status=overall,
+        qdrant=qdrant_status,
+        embedding_provider=embed_status,
+        llm_provider=llm_status,
     )
