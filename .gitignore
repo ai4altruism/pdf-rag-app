@@ -1,18 +1,35 @@
 # Environment variables and secrets
 .env
+.env.*
+!.env.example
 
-# Python virtual environment
+# Python
 .venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+
+# Node
+node_modules/
+.next/
+.turbo/
 
 # Data directories
 data/
-data/pdfs/
-data/chroma_db/
-*.pdf
 
-# Python cache files
-__pycache__/
-utils/__pycache__
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
 
-# Streamlit
-.streamlit/
+# OS
+.DS_Store
+Thumbs.db
