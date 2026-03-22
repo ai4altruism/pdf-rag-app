@@ -70,6 +70,12 @@ def create_reranker_provider(settings: Settings) -> RerankerProvider:
                 api_key=settings.cohere_api_key,
                 model=settings.reranker_model,
             )
+        case "cross-encoder":
+            from src.providers.reranker.cross_encoder import CrossEncoderRerankerProvider
+
+            return CrossEncoderRerankerProvider(
+                model=settings.reranker_model,
+            )
         case _:
             raise ValueError(f"Unknown reranker provider: {settings.reranker_provider}")
 

@@ -86,8 +86,28 @@ class TestSettingsAPI:
 
 
 class TestQueryAPI:
+    def _patch_providers(self, mock_embedding):
+        """Patch all provider factories used by the query route."""
+        from contextlib import ExitStack
+        from unittest.mock import patch
+
+        stack = ExitStack()
+        stack.enter_context(
+            patch("src.api.routes.query.create_embedding_provider", return_value=mock_embedding)
+        )
+        stack.enter_context(
+            patch("src.api.routes.query.create_llm_provider", side_effect=ValueError("no key"))
+        )
+        stack.enter_context(
+            patch(
+                "src.api.routes.query.create_reranker_provider",
+                side_effect=ValueError("no key"),
+            )
+        )
+        return stack
+
     async def test_query_returns_results(self, client, mock_qdrant):
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import AsyncMock
 
         from src.storage.qdrant import SearchResult
 
@@ -110,16 +130,20 @@ class TestQueryAPI:
                     "page_numbers": [1],
                     "header_chain": ["Section 1"],
                     "chunk_text": "Test chunk content",
+                    "parent_chunk_id": "",
+                    "chunk_index": 0,
                 },
             )
         ]
 
-        with patch(
-            "src.api.routes.query.create_embedding_provider", return_value=mock_provider
-        ):
+        with self._patch_providers(mock_provider):
             response = await client.post(
                 "/api/query",
-                json={"query": "test question", "collection_ids": [col_id]},
+                json={
+                    "query": "test question",
+                    "collection_ids": [col_id],
+                    "options": {"multi_query": False, "context_expansion": "off"},
+                },
             )
         assert response.status_code == 200
         data = response.json()
@@ -131,7 +155,7 @@ class TestQueryAPI:
         assert data["metadata"]["retrieval_count"] == 1
 
     async def test_query_empty_collection(self, client, mock_qdrant):
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import AsyncMock
 
         col_resp = await client.post("/api/collections", json={"name": "Empty"})
         col_id = col_resp.json()["id"]
@@ -140,15 +164,44 @@ class TestQueryAPI:
         mock_provider.embed_query.return_value = [0.1] * 1024
         mock_qdrant.hybrid_search.return_value = []
 
-        with patch(
-            "src.api.routes.query.create_embedding_provider", return_value=mock_provider
-        ):
+        with self._patch_providers(mock_provider):
             response = await client.post(
                 "/api/query",
-                json={"query": "test question", "collection_ids": [col_id]},
+                json={
+                    "query": "test question",
+                    "collection_ids": [col_id],
+                    "options": {"multi_query": False, "context_expansion": "off"},
+                },
             )
         assert response.status_code == 200
         assert response.json()["sources"] == []
+
+    async def test_query_response_metadata_shape(self, client, mock_qdrant):
+        from unittest.mock import AsyncMock
+
+        col_resp = await client.post("/api/collections", json={"name": "Meta Test"})
+        col_id = col_resp.json()["id"]
+
+        mock_provider = AsyncMock()
+        mock_provider.embed_query.return_value = [0.1] * 1024
+        mock_qdrant.hybrid_search.return_value = []
+
+        with self._patch_providers(mock_provider):
+            response = await client.post(
+                "/api/query",
+                json={
+                    "query": "test",
+                    "collection_ids": [col_id],
+                    "options": {"multi_query": False, "context_expansion": "off"},
+                },
+            )
+        meta = response.json()["metadata"]
+        assert "retrieval_count" in meta
+        assert "reranked_count" in meta
+        assert "corrective_rag_triggered" in meta
+        assert "query_variations" in meta
+        assert "latency_ms" in meta
+        assert "model_used" in meta
 
 
 class TestConversationsAPI:
