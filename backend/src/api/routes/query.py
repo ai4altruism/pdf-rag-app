@@ -1,12 +1,10 @@
 """Query API — submit questions and get RAG-powered answers."""
 
-import time
-
 from fastapi import APIRouter, Depends
 
-from src.api.routes.collections import _qdrant_collection_name
 from src.config import Settings, get_settings
-from src.providers import create_embedding_provider
+from src.pipelines.query.pipeline import QueryPipeline, QueryPipelineConfig
+from src.providers import create_embedding_provider, create_llm_provider, create_reranker_provider
 from src.schemas import QueryRequest, QueryResponse, SourceResponse
 from src.storage import get_qdrant
 from src.storage.qdrant import QdrantStore
@@ -20,46 +18,48 @@ async def submit_query(
     settings: Settings = Depends(get_settings),
     qdrant: QdrantStore = Depends(get_qdrant),
 ):
-    """Submit a query and retrieve relevant chunks via hybrid search.
+    """Submit a query and retrieve relevant chunks via the full query pipeline.
 
-    Currently performs retrieval only (no reranking or generation — Sprint 5-6).
+    Pipeline stages: multi-query expansion → hybrid search → rerank → context assembly.
     """
-    start_time = time.time()
-
-    # Embed the query
     embedding_provider = create_embedding_provider(settings)
-    query_vector = await embedding_provider.embed_query(body.query)
 
-    # Search across all requested collections
-    all_results = []
-    for col_id in body.collection_ids:
-        qdrant_name = _qdrant_collection_name(col_id)
-        if not await qdrant.collection_exists(qdrant_name):
-            continue
+    # LLM and reranker are optional — pipeline degrades gracefully without them
+    try:
+        llm_provider = create_llm_provider(settings)
+    except (ValueError, Exception):
+        llm_provider = None
 
-        if settings.hybrid_search:
-            results = await qdrant.hybrid_search(
-                collection_name=qdrant_name,
-                query_dense=query_vector,
-                query_text=body.query,
-                top_k=body.options.top_k_retrieval,
-                rrf_k=settings.rrf_k,
-                filters={"embedding_model": settings.embedding_model},
-            )
-        else:
-            results = await qdrant.dense_search(
-                collection_name=qdrant_name,
-                query_dense=query_vector,
-                top_k=body.options.top_k_retrieval,
-                filters={"embedding_model": settings.embedding_model},
-            )
-        all_results.extend(results)
+    try:
+        reranker_provider = create_reranker_provider(settings)
+    except (ValueError, Exception):
+        reranker_provider = None
 
-    # Sort by score and take top_k
-    all_results.sort(key=lambda r: r.score, reverse=True)
-    top_results = all_results[: body.options.top_k_retrieval]
+    pipeline = QueryPipeline(
+        qdrant=qdrant,
+        embedding_provider=embedding_provider,
+        llm_provider=llm_provider,
+        reranker_provider=reranker_provider,
+    )
 
-    # Build source responses
+    config = QueryPipelineConfig(
+        multi_query=body.options.multi_query,
+        hybrid_search=settings.hybrid_search,
+        rrf_k=settings.rrf_k,
+        top_k_retrieval=body.options.top_k_retrieval,
+        top_k_rerank=body.options.top_k_rerank,
+        context_expansion=body.options.context_expansion,
+        max_context_tokens=body.options.max_context_tokens,
+        embedding_model_filter=settings.embedding_model,
+    )
+
+    result = await pipeline.run(
+        query=body.query,
+        collection_ids=body.collection_ids,
+        config=config,
+    )
+
+    # Build source responses from context chunks
     sources = [
         SourceResponse(
             document_id=r.payload.get("document_id", ""),
@@ -69,20 +69,18 @@ async def submit_query(
             chunk_text=r.payload.get("chunk_text", ""),
             relevance_score=round(r.score, 4),
         )
-        for r in top_results
+        for r in result.context_chunks
     ]
 
-    latency_ms = int((time.time() - start_time) * 1000)
-
     return QueryResponse(
-        answer="Retrieval complete. Reranking and generation not yet implemented (Sprint 5-6).",
+        answer="Context retrieved. LLM generation not yet implemented (Sprint 6).",
         sources=sources,
         metadata={
-            "retrieval_count": len(top_results),
-            "reranked_count": 0,
+            "retrieval_count": result.retrieval_count,
+            "reranked_count": result.reranked_count,
             "corrective_rag_triggered": False,
-            "query_variations": [body.query],
-            "latency_ms": latency_ms,
+            "query_variations": result.query_variations,
+            "latency_ms": result.latency_ms,
             "model_used": settings.llm_model,
         },
     )

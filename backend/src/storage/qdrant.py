@@ -243,6 +243,38 @@ class QdrantStore:
             for point in results.points
         ]
 
+    async def get_points_by_ids(
+        self, collection_name: str, point_ids: list[str]
+    ) -> list:
+        """Retrieve specific points by their IDs."""
+        if not point_ids:
+            return []
+        result = await self._client.retrieve(
+            collection_name=collection_name,
+            ids=point_ids,
+            with_payload=True,
+        )
+        return result
+
+    async def get_points_by_filter(
+        self,
+        collection_name: str,
+        filters: dict,
+        limit: int = 100,
+    ) -> list:
+        """Retrieve points matching a filter."""
+        qdrant_filter = self._build_filter(filters)
+        if not qdrant_filter:
+            return []
+        result = await self._client.scroll(
+            collection_name=collection_name,
+            scroll_filter=qdrant_filter,
+            limit=limit,
+            with_payload=True,
+        )
+        # scroll returns (points, next_page_offset)
+        return result[0] if result else []
+
     async def get_points_count(self, collection_name: str) -> int:
         """Get the number of points in a collection."""
         info = await self._client.get_collection(collection_name)
