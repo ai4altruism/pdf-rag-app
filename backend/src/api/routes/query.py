@@ -1,12 +1,25 @@
 """Query API — submit questions and get RAG-powered answers."""
 
+import json
+
 from fastapi import APIRouter, Depends
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from src.config import Settings, get_settings
-from src.pipelines.query.pipeline import QueryPipeline, QueryPipelineConfig
+from src.models.conversation import Conversation
+from src.models.message import Message
+from src.pipelines.query.generator import AnswerGenerator
+from src.pipelines.query.pipeline import (
+    INSUFFICIENT_CONTEXT_MSG,
+    QueryPipeline,
+    QueryPipelineConfig,
+)
 from src.providers import create_embedding_provider, create_llm_provider, create_reranker_provider
 from src.schemas import QueryRequest, QueryResponse, SourceResponse
 from src.storage import get_qdrant
+from src.storage.database import get_db
 from src.storage.qdrant import QdrantStore
 
 router = APIRouter(prefix="/query", tags=["query"])
@@ -17,10 +30,11 @@ async def submit_query(
     body: QueryRequest,
     settings: Settings = Depends(get_settings),
     qdrant: QdrantStore = Depends(get_qdrant),
+    db: AsyncSession = Depends(get_db),
 ):
-    """Submit a query and retrieve relevant chunks via the full query pipeline.
+    """Submit a query and get a RAG-powered answer.
 
-    Pipeline stages: multi-query expansion → hybrid search → rerank → context assembly.
+    Pipeline: multi-query expansion → hybrid search → rerank → corrective RAG → generate.
     """
     embedding_provider = create_embedding_provider(settings)
 
@@ -51,7 +65,14 @@ async def submit_query(
         context_expansion=body.options.context_expansion,
         max_context_tokens=body.options.max_context_tokens,
         embedding_model_filter=settings.embedding_model,
+        corrective_rag=body.options.corrective_rag,
+        corrective_rag_threshold=settings.corrective_rag_threshold,
     )
+
+    # Load conversation history if provided
+    conversation_history = None
+    if body.conversation_id:
+        conversation_history = await _load_conversation_history(db, body.conversation_id)
 
     result = await pipeline.run(
         query=body.query,
@@ -59,7 +80,19 @@ async def submit_query(
         config=config,
     )
 
-    # Build source responses from context chunks
+    # Generate answer
+    if result.insufficient_context:
+        answer = INSUFFICIENT_CONTEXT_MSG
+    elif llm_provider and result.context_chunks:
+        generator = AnswerGenerator(llm_provider)
+        gen_result = await generator.generate(
+            body.query, result.context_chunks, conversation_history
+        )
+        answer = gen_result.answer
+    else:
+        answer = "Context retrieved. LLM not available for generation."
+
+    # Build source responses
     sources = [
         SourceResponse(
             document_id=r.payload.get("document_id", ""),
@@ -72,15 +105,66 @@ async def submit_query(
         for r in result.context_chunks
     ]
 
+    # Save messages to conversation if conversation_id provided
+    if body.conversation_id:
+        await _save_messages(
+            db, body.conversation_id, body.query, answer, sources
+        )
+
     return QueryResponse(
-        answer="Context retrieved. LLM generation not yet implemented (Sprint 6).",
+        answer=answer,
         sources=sources,
         metadata={
             "retrieval_count": result.retrieval_count,
             "reranked_count": result.reranked_count,
-            "corrective_rag_triggered": False,
+            "corrective_rag_triggered": result.corrective_rag_triggered,
             "query_variations": result.query_variations,
             "latency_ms": result.latency_ms,
             "model_used": settings.llm_model,
         },
     )
+
+
+async def _load_conversation_history(
+    db: AsyncSession, conversation_id: str
+) -> list[dict] | None:
+    """Load prior messages from a conversation for multi-turn context."""
+    stmt = (
+        select(Conversation)
+        .options(selectinload(Conversation.messages))
+        .where(Conversation.id == conversation_id)
+    )
+    result = await db.execute(stmt)
+    conversation = result.scalar_one_or_none()
+    if not conversation or not conversation.messages:
+        return None
+
+    history = []
+    for msg in sorted(conversation.messages, key=lambda m: m.created_at):
+        history.append({"role": msg.role, "content": msg.content})
+    return history
+
+
+async def _save_messages(
+    db: AsyncSession,
+    conversation_id: str,
+    query: str,
+    answer: str,
+    sources: list[SourceResponse],
+) -> None:
+    """Save user query and assistant response to the conversation."""
+    user_msg = Message(
+        conversation_id=conversation_id,
+        role="user",
+        content=query,
+    )
+    sources_json = json.dumps([s.model_dump() for s in sources])
+    assistant_msg = Message(
+        conversation_id=conversation_id,
+        role="assistant",
+        content=answer,
+        sources=sources_json,
+    )
+    db.add(user_msg)
+    db.add(assistant_msg)
+    await db.flush()
