@@ -1,4 +1,4 @@
-"""Query pipeline orchestrator — expand → search → rerank → assemble context."""
+"""Query pipeline orchestrator — expand → search → rerank → validate → assemble context."""
 
 import time
 from dataclasses import dataclass, field
@@ -7,10 +7,15 @@ from src.api.routes.collections import _qdrant_collection_name
 from src.logging import get_logger
 from src.pipelines.query.context import ContextAssembler
 from src.pipelines.query.expander import QueryExpander
+from src.pipelines.query.validator import RelevanceValidator
 from src.providers.base import EmbeddingProvider, LLMProvider, RerankerProvider
 from src.storage.qdrant import QdrantStore, SearchResult
 
 logger = get_logger(__name__)
+
+INSUFFICIENT_CONTEXT_MSG = (
+    "The provided documents do not contain sufficient information to answer this question."
+)
 
 
 @dataclass
@@ -25,6 +30,8 @@ class QueryPipelineConfig:
     context_expansion: str = "parent"
     max_context_tokens: int = 8000
     embedding_model_filter: str = ""
+    corrective_rag: bool = True
+    corrective_rag_threshold: float = 0.5
 
 
 @dataclass
@@ -36,10 +43,13 @@ class QueryPipelineResult:
     retrieval_count: int = 0
     reranked_count: int = 0
     latency_ms: int = 0
+    corrective_rag_triggered: bool = False
+    retrieval_attempts: int = 1
+    insufficient_context: bool = False
 
 
 class QueryPipeline:
-    """Orchestrates the full query pipeline: expand → search → rerank → assemble.
+    """Orchestrates the full query pipeline: expand → search → rerank → validate → assemble.
 
     Each stage is independently configurable/skippable.
     """
@@ -81,32 +91,69 @@ class QueryPipeline:
         else:
             query_variations = [query]
 
-        # --- Stage 2: Hybrid search across collections ---
-        all_results = await self._search_collections(
-            queries=query_variations,
-            collection_ids=collection_ids,
-            config=cfg,
-            filters=filters,
+        # --- Stage 2 + 3: Search + Rerank (with corrective RAG retry loop) ---
+        corrective_triggered = False
+        retrieval_attempts = 0
+        all_results: list[SearchResult] = []
+        current_query = query
+
+        validator = (
+            RelevanceValidator(self._llm, threshold=cfg.corrective_rag_threshold)
+            if cfg.corrective_rag and self._llm
+            else None
         )
+        max_attempts = validator.max_attempts if validator else 1
 
-        # Deduplicate by point ID, keeping highest score
-        all_results = self._deduplicate(all_results)
+        for attempt in range(1, max_attempts + 1):
+            retrieval_attempts = attempt
 
-        # Sort by score and take top_k_retrieval
-        all_results.sort(key=lambda r: r.score, reverse=True)
-        all_results = all_results[: cfg.top_k_retrieval]
+            # Search
+            search_queries = query_variations if attempt == 1 else [current_query]
+            all_results = await self._search_collections(
+                queries=search_queries,
+                collection_ids=collection_ids,
+                config=cfg,
+                filters=filters,
+            )
+            all_results = self._deduplicate(all_results)
+            all_results.sort(key=lambda r: r.score, reverse=True)
+            all_results = all_results[: cfg.top_k_retrieval]
+
+            # Rerank
+            if self._reranker and all_results:
+                all_results = await self._rerank(current_query, all_results, cfg.top_k_rerank)
+
+            # Validate (corrective RAG)
+            if validator and all_results and attempt < max_attempts:
+                score, is_relevant = await validator.validate(current_query, all_results)
+                if is_relevant:
+                    break
+                # Not relevant — reformulate and retry
+                corrective_triggered = True
+                current_query = await validator.reformulate(current_query)
+                logger.info(
+                    "corrective_rag_retry",
+                    attempt=attempt,
+                    score=score,
+                    reformulated_query=current_query[:100],
+                )
+            else:
+                break
+
         retrieval_count = len(all_results)
-
-        # --- Stage 3: Rerank ---
-        if self._reranker and all_results:
-            all_results = await self._rerank(query, all_results, cfg.top_k_rerank)
         reranked_count = len(all_results)
+
+        # Check if we exhausted attempts without finding relevant results
+        insufficient_context = False
+        if validator and all_results and corrective_triggered:
+            _, final_relevant = await validator.validate(current_query, all_results)
+            if not final_relevant:
+                insufficient_context = True
 
         # --- Stage 4: Context assembly ---
         assembler = ContextAssembler(
             self._qdrant, max_context_tokens=cfg.max_context_tokens
         )
-        # For context expansion, use the first collection (primary)
         primary_collection = _qdrant_collection_name(collection_ids[0])
         context_chunks = await assembler.assemble(
             all_results, primary_collection, mode=cfg.context_expansion
@@ -121,6 +168,8 @@ class QueryPipeline:
             retrieved=retrieval_count,
             reranked=reranked_count,
             context_chunks=len(context_chunks),
+            corrective_rag=corrective_triggered,
+            retrieval_attempts=retrieval_attempts,
             latency_ms=latency_ms,
         )
 
@@ -130,6 +179,9 @@ class QueryPipeline:
             retrieval_count=retrieval_count,
             reranked_count=reranked_count,
             latency_ms=latency_ms,
+            corrective_rag_triggered=corrective_triggered,
+            retrieval_attempts=retrieval_attempts,
+            insufficient_context=insufficient_context,
         )
 
     async def _search_collections(
@@ -142,7 +194,6 @@ class QueryPipeline:
         """Search across multiple collections with all query variations."""
         all_results: list[SearchResult] = []
 
-        # Build search filters
         search_filters = dict(filters or {})
         if config.embedding_model_filter:
             search_filters["embedding_model"] = config.embedding_model_filter
@@ -188,7 +239,6 @@ class QueryPipeline:
             top_k=top_k,
         )
 
-        # Map reranked results back to SearchResults with updated scores
         reranked_results = []
         for rr in reranked:
             original = results[rr.index]
